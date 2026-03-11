@@ -126,60 +126,94 @@ void VL53L4CDSensor::setup() {
 }
 
 bool VL53L4CDSensor::init_sensor_() {
-  // Verify model ID (datasheet: 0xEBAA at register 0x010F)
-  uint16_t model_id = read_word_(IDENTIFICATION_MODEL_ID);
+  // Short delay so the sensor is stable on a shared I2C bus after power-on
+  delay(20);
+
+  // ── Step 1: Model ID ────────────────────────────────────────────────────────
+  ESP_LOGI(TAG, "'%s' [1/6] Checking model ID...", this->name_.c_str());
+  uint16_t model_id = 0;
+  for (int attempt = 0; attempt < 5; attempt++) {
+    uint8_t buf[2] = {};
+    i2c::ErrorCode err = this->read_register16(IDENTIFICATION_MODEL_ID, buf, 2);
+    if (err != i2c::ERROR_OK) {
+      ESP_LOGW(TAG, "'%s' Model ID read I2C error %d (attempt %d/5)",
+               this->name_.c_str(), (int) err, attempt + 1);
+      delay(10);
+      continue;
+    }
+    model_id = ((uint16_t) buf[0] << 8) | buf[1];
+    break;
+  }
   if (model_id != 0xEBAA) {
-    ESP_LOGE(TAG, "'%s' - wrong model ID 0x%04X (expected 0xEBAA)", this->name_.c_str(), model_id);
+    ESP_LOGE(TAG, "'%s' [1/6] FAILED – model ID 0x%04X (expected 0xEBAA)", this->name_.c_str(), model_id);
     return false;
   }
+  ESP_LOGI(TAG, "'%s' [1/6] Model ID OK: 0x%04X", this->name_.c_str(), model_id);
 
-  // Wait for firmware boot (status = 0x03)
+  // ── Step 2: Firmware boot ────────────────────────────────────────────────────
+  ESP_LOGI(TAG, "'%s' [2/6] Waiting for firmware boot...", this->name_.c_str());
   uint32_t start = millis();
-  while (read_byte_(FIRMWARE_SYSTEM_STATUS) != 0x03) {
+  while (true) {
+    uint8_t fw_buf = 0;
+    i2c::ErrorCode fw_err = this->read_register16(FIRMWARE_SYSTEM_STATUS, &fw_buf, 1);
+    if (fw_err == i2c::ERROR_OK && fw_buf == 0x03) break;
     if (millis() - start > timeout_ms_) {
-      ESP_LOGE(TAG, "'%s' - timeout waiting for firmware boot", this->name_.c_str());
+      ESP_LOGE(TAG, "'%s' [2/6] FAILED – firmware boot timeout (status=0x%02X, err=%d)",
+               this->name_.c_str(), fw_buf, (int) fw_err);
       return false;
     }
     App.feed_wdt();
     delay(1);
   }
+  ESP_LOGI(TAG, "'%s' [2/6] Firmware ready", this->name_.c_str());
 
-  // Write I/O voltage and fast-mode-plus config for registers 0x2D–0x2F
+  // ── Step 3: I/O voltage config ───────────────────────────────────────────────
+  ESP_LOGI(TAG, "'%s' [3/6] Writing I/O voltage config...", this->name_.c_str());
   write_byte_(0x2D, 0x00);  // fast_mode_plus = false
-  write_byte_(0x2E, 0x01);  // io_2v8 = true (pull-up to AVDD / 2V8)
+  write_byte_(0x2E, 0x01);  // io_2v8 = true
   write_byte_(0x2F, 0x01);  // io_2v8 = true
 
-  // Write default config block 0x30–0x87 in one I2C transaction
-  this->write_register16(0x0030, VL53L4CD_DEFAULT_CONFIG, sizeof(VL53L4CD_DEFAULT_CONFIG));
+  // ── Step 4: Default config block ────────────────────────────────────────────
+  ESP_LOGI(TAG, "'%s' [4/6] Writing default config block (%u bytes)...",
+           this->name_.c_str(), (unsigned) sizeof(VL53L4CD_DEFAULT_CONFIG));
+  i2c::ErrorCode cfg_err =
+      this->write_register16(0x0030, VL53L4CD_DEFAULT_CONFIG, sizeof(VL53L4CD_DEFAULT_CONFIG));
+  if (cfg_err != i2c::ERROR_OK) {
+    ESP_LOGE(TAG, "'%s' [4/6] FAILED – default config write error %d",
+             this->name_.c_str(), (int) cfg_err);
+    return false;
+  }
+  ESP_LOGI(TAG, "'%s' [4/6] Default config written", this->name_.c_str());
 
-  // Trigger VHV calibration
+  // ── Step 5: VHV calibration ─────────────────────────────────────────────────
+  ESP_LOGI(TAG, "'%s' [5/6] Starting VHV calibration...", this->name_.c_str());
   write_byte_(SYSTEM_START, 0x40);
   start = millis();
   while (!data_ready_()) {
     if (millis() - start > timeout_ms_) {
-      ESP_LOGE(TAG, "'%s' - timeout waiting for VHV calibration", this->name_.c_str());
+      ESP_LOGE(TAG, "'%s' [5/6] FAILED – VHV calibration timeout", this->name_.c_str());
       return false;
     }
     App.feed_wdt();
     delay(1);
   }
-
   clear_interrupt_();
   stop_continuous_();
-
-  // Finish VHV setup
   write_byte_(VHV_CONFIG_TIMEOUT_MACROP_LOOP_BOUND, 0x09);
   write_byte_(0x000B, 0x00);
   write_word_(0x0024, 0x0500);
+  ESP_LOGI(TAG, "'%s' [5/6] VHV calibration done", this->name_.c_str());
 
-  // Apply user-configured timing
+  // ── Step 6: Range timing ─────────────────────────────────────────────────────
+  ESP_LOGI(TAG, "'%s' [6/6] Setting range timing (%u ms budget, %u ms inter-meas)...",
+           this->name_.c_str(), timing_budget_ms_, inter_measurement_ms_);
   if (!set_range_timing_()) {
-    ESP_LOGE(TAG, "'%s' - failed to set range timing", this->name_.c_str());
+    ESP_LOGE(TAG, "'%s' [6/6] FAILED – could not set range timing", this->name_.c_str());
     return false;
   }
 
-  // Start continuous measurements
   start_continuous_();
+  ESP_LOGI(TAG, "'%s' [6/6] Continuous measurements started", this->name_.c_str());
   return true;
 }
 
