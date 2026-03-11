@@ -3,6 +3,7 @@
 // which itself is based on ST's VL53L4CD Ultra Lite Driver (ULD) API (STSW-IMG026).
 
 #include "vl53l4cd.h"
+#include "esphome/core/application.h"
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
 
